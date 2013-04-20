@@ -25,6 +25,10 @@ import socket
 import sys
 import traceback
 
+import mechanize
+import urlparse
+import re
+
 logging.basicConfig(format="%(name)s %(levelname)s - %(message)s")
 log = logging.getLogger("pypopper")
 log.setLevel(logging.INFO)
@@ -72,36 +76,49 @@ class Message(object):
             msg.close()
 
 
-def handleUser(data, msg):
+def handleUser(data, scrapper):
+    scrapper.username = data.split(' ',1)[1]
     return "+OK user accepted"
 
-def handlePass(data, msg):
-    return "+OK pass accepted"
+def handlePass(data, scrapper):
+    if hasattr(scrapper, 'username') and scrapper.login(data.split(' ',1)[1]):
+        return "+OK pass accepted"
+    else:
+        return "-ERR Authentication failed."
 
-def handleStat(data, msg):
-    return "+OK 1 %i" % msg.size
+def handleStat(data, scrapper):
+    print data
+    try:
+        return "+OK 1 %i" % scrapper.size(1)
+    except:
+        return "-ERR No such message"
 
-def handleList(data, msg):
-    return "+OK 1 messages (%i octets)\r\n1 %i\r\n." % (msg.size, msg.size)
+def handleList(data, scrapper):
+    print data
+    return "+OK 1 messages (%i octets)\r\n1 %i\r\n." % (scrapper.size(1), scrapper.size(1))
 
-def handleTop(data, msg):
+def handleTop(data, scrapper):
+    print data
     cmd, num, lines = data.split()
     assert num == "1", "unknown message number: %s" % num
     lines = int(lines)
     text = msg.top + "\r\n\r\n" + "\r\n".join(msg.bot[:lines])
     return "+OK top of message follows\r\n%s\r\n." % text
 
-def handleRetr(data, msg):
+def handleRetr(data, scrapper):
+    print data
     log.info("message sent")
-    return "+OK %i octets\r\n%s\r\n." % (msg.size, msg.data)
+    msg =  scrapper.top_body(1)
+    return "+OK %i octets\r\n%s\r\n." %(len (msg), msg )
 
-def handleDele(data, msg):
+def handleDele(data, scrapper):
+    print data
     return "+OK message 1 deleted"
 
-def handleNoop(data, msg):
+def handleNoop(data, scrapper):
     return "+OK"
 
-def handleQuit(data, msg):
+def handleQuit(data, scrapper):
     return "+OK pypopper POP3 server signing off"
 
 dispatch = dict(
@@ -116,8 +133,7 @@ dispatch = dict(
     QUIT=handleQuit,
 )
 
-def serve(host, port, filename):
-    assert os.path.exists(filename)
+def serve(host, port, scrapper):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind((host, port))
     try:
@@ -125,24 +141,26 @@ def serve(host, port, filename):
             hostname = host
         else:
             hostname = "localhost"
-        log.info("pypopper POP3 serving '%s' on %s:%s", filename, hostname, port)
+        log.info("pypopper POP3 serving '%s' on %s:%s", scrapper, hostname, port)
         while True:
             sock.listen(1)
             conn, addr = sock.accept()
             log.debug('Connected by %s', addr)
             try:
-                msg = Message(filename)
                 conn = ChatterboxConnection(conn)
                 conn.sendall("+OK pypopper file-based pop3 server ready")
                 while True:
                     data = conn.recvall()
-                    command = data.split(None, 1)[0]
+                    print "*"*40
+                    print data
+                    print "*"*40
+                    command = data.split(None, 1)[0].upper()
                     try:
                         cmd = dispatch[command]
                     except KeyError:
                         conn.sendall("-ERR unknown command")
                     else:
-                        conn.sendall(cmd(data, msg))
+                        conn.sendall(cmd(data, scrapper))
                         if cmd is handleQuit:
                             break
             finally:
@@ -156,11 +174,88 @@ def serve(host, port, filename):
         sock.shutdown(socket.SHUT_RDWR)
         sock.close()
 
+class Libero(object):
+    DEBUG = 1
+    br=None
+    progressivo = 0
+
+    def strip_tags( self, html , r = ''):
+        return re.sub(r'<[^>]*?>', r, html)
+
+    def log(self, response, html =  None):
+        if self.DEBUG:
+            print response.info()
+            if not html:
+                html = response.read()
+            open('log/out_%04i.html' % self.progressivo,'w').write(html)
+            self.progressivo += 1
+
+    def login(self, _pass):
+        self.baseurl = "http://m.libero.it/"
+        self.br = mechanize.Browser()
+        self.br.set_handle_robots(False)
+        self.br.addheaders = [('User-agent', 'Mozilla/5.0 (Linux; U; Android 4.1.1; he-il; Nexus 7 Build/JRO03D) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Safari/534.30')]
+
+        response = self.br.open(self.baseurl)
+        self.log(response)
+        response = self.br.follow_link(text="Mail", nr=0)
+        self.log(response)
+        response.info()['content-type'] = ' text/html; charset=utf-8'
+
+        self.br.select_form(nr=0)
+        self.br['LOGINID'] = self.username
+        self.br['PASSWORD'] = _pass
+        response = self.br.submit()
+
+        self.html = response.read()
+        self.log(response,self.html)
+        if self.DEBUG:
+            self.coda = self.messaggi()
+        else:
+            self.coda = self.messaggi_non_letti()
+        return not ("Libero ID o password errata." in self.html or "Libero ID non valido." in self.html)
+
+    def top_body(self,n):
+        n-=1
+        url = self.coda[n][0]
+        self.html = self.get (self.baseurl, url)
+
+
+    def size(self,n):
+        n-=1
+        ret = self.coda[n][1].split()
+        if ret[1].upper() == 'KB':
+            ret = float(ret[0]) * 1024
+        elif ret[1].upper() == 'MB':
+            ret = float(ret[0]) * 1024 * 1024
+        else:
+            ret = float(ret[0])
+        return ret
+
+    def messaggi(self):
+        ret = re.findall(r'href="(/m/wmm/read/INBOX/\d+/\d+)".*?(\d+\.\d+ .B)</span>', self.html, re.I)
+        return ret
+
+    def messaggi_non_letti(self):
+        ret = re.findall(r'href="(/m/wmm/read/INBOX/\d+/\d+)".*?row_mail_element"><b>.*?(\d+\.\d+ .B)</span>', self.html, re.I)
+        return ret
+
+    def get(self, url, url_to_join = None ):
+        if url_to_join:
+            url = urlparse.urljoin( url, url_to_join )
+        response = self.br.open(url)
+        self.html = response.read()
+        self.log(response, self.html)
+        return self.html
+
+    def __init__(self):
+        pass
+
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print "USAGE: [<host>:]<port> <path_to_message_file>"
+    if len(sys.argv) != 2:
+        print "USAGE: [<host>:]<port>"
     else:
-        _, port, filename = sys.argv
+        _, port = sys.argv
         if ":" in port:
             host = port[:port.index(":")]
             port = port[port.index(":") + 1:]
@@ -171,8 +266,4 @@ if __name__ == "__main__":
         except Exception:
             print "Unknown port:", port
         else:
-            if os.path.exists(filename):
-                serve(host, port, filename)
-            else:
-                print "File not found:", filename
-## end of http://code.activestate.com/recipes/534131/ }}}
+            serve(host, port, Libero())
