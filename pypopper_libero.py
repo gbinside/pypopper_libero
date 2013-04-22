@@ -26,8 +26,10 @@ import sys
 import traceback
 
 import mechanize
+import urllib
 import urlparse
 import re
+import HTMLParser
 
 logging.basicConfig(format="%(name)s %(levelname)s - %(message)s")
 log = logging.getLogger("pypopper")
@@ -63,7 +65,6 @@ class ChatterboxConnection(object):
         log.debug("recv: %r", "".join(data))
         return "".join(data)
 
-
 class Message(object):
     def __init__(self, filename):
         msg = open(filename, "r")
@@ -74,7 +75,6 @@ class Message(object):
             self.bot = bot.split("\r\n")
         finally:
             msg.close()
-
 
 def handleUser(data, scrapper):
     scrapper.username = data.split(' ',1)[1]
@@ -89,26 +89,24 @@ def handlePass(data, scrapper):
 def handleStat(data, scrapper):
     print data
     try:
-        return "+OK 1 %i" % scrapper.size(1)
+        return "+OK 1 %i" % scrapper.size(0)
     except:
         return "-ERR No such message"
 
 def handleList(data, scrapper):
     print data
-    return "+OK 1 messages (%i octets)\r\n1 %i\r\n." % (scrapper.size(1), scrapper.size(1))
+    return "+OK 1 messages (%i octets)\r\n1 %i\r\n." % (scrapper.size(0), scrapper.size(0))
 
 def handleTop(data, scrapper):
     print data
     cmd, num, lines = data.split()
     assert num == "1", "unknown message number: %s" % num
-    lines = int(lines)
-    text = msg.top + "\r\n\r\n" + "\r\n".join(msg.bot[:lines])
-    return "+OK top of message follows\r\n%s\r\n." % text
+    return "+OK top of message follows\r\n%s\r\n." % scrapper.top(num-1)
 
 def handleRetr(data, scrapper):
     print data
     log.info("message sent")
-    msg =  scrapper.top_body(1)
+    msg =  scrapper.top(0)+scrapper.body(0)
     return "+OK %i octets\r\n%s\r\n." %(len (msg), msg )
 
 def handleDele(data, scrapper):
@@ -191,29 +189,51 @@ class Libero(object):
             self.progressivo += 1
 
     def login(self, _pass):
-        self.baseurl = "http://m.libero.it/"
+        self.baseurl = "http://www.libero.it/"
         self.br = mechanize.Browser()
         self.br.set_handle_robots(False)
         self.br.addheaders = [('User-agent', 'Mozilla/5.0 (Linux; U; Android 4.1.1; he-il; Nexus 7 Build/JRO03D) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Safari/534.30')]
 
         response = self.br.open(self.baseurl)
         self.log(response)
-        response = self.br.follow_link(text="Mail", nr=0)
-        self.log(response)
-        response.info()['content-type'] = ' text/html; charset=utf-8'
 
+        response = self.br.follow_link(text="MAIL", nr=0)
+        self.log(response)
+
+        response.info()['content-type'] = ' text/html; charset=utf-8'
         self.br.select_form(nr=0)
         self.br['LOGINID'] = self.username
         self.br['PASSWORD'] = _pass
         response = self.br.submit()
-
         self.html = response.read()
-        self.log(response,self.html)
-        if self.DEBUG:
-            self.coda = self.messaggi()
+        self.log(response, self.html)
+                
+        next_url = re.findall(r'id="main"\s*src="([^"]*)"', self.html, re.I)
+        print next_url
+        if next_url:
+            self.get(next_url[0])
+            self.baseurl = next_url[0] 
         else:
-            self.coda = self.messaggi_non_letti()
-        return not ("Libero ID o password errata." in self.html or "Libero ID non valido." in self.html)
+            return 0      
+
+        self.br.select_form(nr=0)
+        response = self.br.submit()
+        self.html = response.read()
+        self.log(response, self.html)
+        
+        self.token_hash = ''.join ( re.findall(r'tokenHash\s*:\s*"([^"]*)"', self.html, re.I) )
+
+        next_url_2 = re.findall(r'mailFrameUrl:"/cp/ps/Mail/MailFrame\?([^"]*)"', self.html, re.I)
+        if next_url_2:
+            url = "/cp/ps/Mail/commands/SyncFolder?%s#" % next_url_2[0]
+            self.get( next_url[0], url )
+            self.params = next_url_2[0]
+        else:
+            return 0      
+                
+        self.coda = self.messaggi()
+        #return not ("Libero ID o password errata." in self.html or "Libero ID non valido." in self.html)
+        return 1
 
     def top_body(self,n):
         n-=1
@@ -222,34 +242,89 @@ class Libero(object):
 
 
     def size(self,n):
-        n-=1
-        ret = self.coda[n][1].split()
-        if ret[1].upper() == 'KB':
-            ret = float(ret[0]) * 1024
-        elif ret[1].upper() == 'MB':
-            ret = float(ret[0]) * 1024 * 1024
-        else:
-            ret = float(ret[0])
+        ret = len( self.top(n) ) + len( self.body(n) )
         return ret
+
+    def follow_src(self, html):
+        ret = []
+        for url in re.findall ( r'src="([^"]*")' , html, re.I ):
+            ret.append( self.get( url ) )
+        return ret
+
+    def filter_message(self, html):
+        mark = '<div class="onlyMessage" id="onlyMessage">'
+        ret = ''
+        if mark in html:
+            start = html.find(mark)
+            ptr = start+len(mark)
+            depth = 1
+            len_html = len(html)
+            while depth and ptr<len_html:
+                if html[ptr:ptr+4].lower() == '<div': #@todo replace with regex
+                    depth += 1
+                elif html[ptr:ptr+5].lower() == '</div': #@todo replace with regex
+                    depth -= 1
+                ptr += 1;
+            if depth == 0:
+                ret = html[start+len(mark) : ptr-1]
+        return ret
+
 
     def messaggi(self):
-        ret = re.findall(r'href="(/m/wmm/read/INBOX/\d+/\d+)".*?(\d+\.\d+ .B)</span>', self.html, re.I)
+        ret = []
+        data = re.findall(r'id="([a-z0-9]*)" uid="(\d+)" i="(\d+)" from="([^"]*)"', self.html, re.I)
+        if self.DEBUG and data: data = data[:2]
+        ret = dict ( [ ( x[2], x ) for x in data ] )
         return ret
 
-    def messaggi_non_letti(self):
-        ret = re.findall(r'href="(/m/wmm/read/INBOX/\d+/\d+)".*?row_mail_element"><b>.*?(\d+\.\d+ .B)</span>', self.html, re.I)
-        return ret
+    def top(self, n):
+        pid, uid, i, _from = self.coda[n]
+
+        url = "/cp/ps/Mail/commands/LoadMessage?"
+        full_url = url + self.params +'&'+ urllib.urlencode( {
+          'pid':pid,
+          'uid':uid,
+          'an':'DefaultMailAccount',
+          'fp':'inbox',
+          'sh':'true',
+        } )
+        _top = [self.htmlparser.unescape( x.strip().strip('<pre>').strip('</pre>') ) for x in self.get ( self.baseurl, full_url).splitlines() if x.strip().strip('<pre>').strip('</pre>')]
+        _top = '\r\n'.join(_top[:-1])
+
+        return _top
+
+    def body(self, n):
+        pid, uid, i, _from = self.coda[n]
+
+        url = "/cp/ps/Mail/commands/LoadMessage?"
+        full_url = url + self.params +'&'+ urllib.urlencode( {
+          'pid':pid,
+          'uid':uid,
+          'an':'DefaultMailAccount',
+          'fp':'inbox',
+        } )
+        self.get ( self.baseurl, full_url)
+
+        url = "/cp/MailMessageBody.jsp?"
+        full_url = url + urllib.urlencode( {
+          'pid' : pid,
+          'th'  : self.token_hash,
+        } )
+        _body = self.filter_message( self.get ( self.baseurl, full_url) )
+
+        return _body
 
     def get(self, url, url_to_join = None ):
         if url_to_join:
             url = urlparse.urljoin( url, url_to_join )
+            if self.DEBUG: print url
         response = self.br.open(url)
         self.html = response.read()
         self.log(response, self.html)
         return self.html
 
     def __init__(self):
-        pass
+        self.htmlparser = HTMLParser.HTMLParser()
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -267,3 +342,10 @@ if __name__ == "__main__":
             print "Unknown port:", port
         else:
             serve(host, port, Libero())
+
+    """
+    libero = Libero()
+    libero.username= "gambuzzi@libero.it"
+    print libero.login('-------------')
+       
+    print libero.coda"""
