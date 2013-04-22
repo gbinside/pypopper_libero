@@ -19,8 +19,10 @@
 Useage:
     python pypopper.py <port> <path_to_message_file>
 """
+import collections
 import logging
 import os
+import quopri
 import socket
 import sys
 import traceback
@@ -87,30 +89,27 @@ def handlePass(data, scrapper):
         return "-ERR Authentication failed."
 
 def handleStat(data, scrapper):
-    print data
     try:
         return "+OK 1 %i" % scrapper.size(0)
     except:
+        raise
         return "-ERR No such message"
 
 def handleList(data, scrapper):
-    print data
     return "+OK 1 messages (%i octets)\r\n1 %i\r\n." % (scrapper.size(0), scrapper.size(0))
 
 def handleTop(data, scrapper):
-    print data
     cmd, num, lines = data.split()
     assert num == "1", "unknown message number: %s" % num
     return "+OK top of message follows\r\n%s\r\n." % scrapper.top(num-1)
 
 def handleRetr(data, scrapper):
-    print data
     log.info("message sent")
     msg =  scrapper.top(0)+scrapper.body(0)
     return "+OK %i octets\r\n%s\r\n." %(len (msg), msg )
 
 def handleDele(data, scrapper):
-    print data
+    scrapper.delete(0)
     return "+OK message 1 deleted"
 
 def handleNoop(data, scrapper):
@@ -176,6 +175,7 @@ class Libero(object):
     DEBUG = 1
     br=None
     progressivo = 0
+    cache = collections.defaultdict(dict)
 
     def strip_tags( self, html , r = ''):
         return re.sub(r'<[^>]*?>', r, html)
@@ -189,6 +189,7 @@ class Libero(object):
             self.progressivo += 1
 
     def login(self, _pass):
+        self.cache = collections.defaultdict(dict)
         self.baseurl = "http://www.libero.it/"
         self.br = mechanize.Browser()
         self.br.set_handle_robots(False)
@@ -235,12 +236,6 @@ class Libero(object):
         #return not ("Libero ID o password errata." in self.html or "Libero ID non valido." in self.html)
         return 1
 
-    def top_body(self,n):
-        n-=1
-        url = self.coda[n][0]
-        self.html = self.get (self.baseurl, url)
-
-
     def size(self,n):
         ret = len( self.top(n) ) + len( self.body(n) )
         return ret
@@ -269,50 +264,87 @@ class Libero(object):
                 ret = html[start+len(mark) : ptr-1]
         return ret
 
-
     def messaggi(self):
         ret = []
         data = re.findall(r'id="([a-z0-9]*)" uid="(\d+)" i="(\d+)" from="([^"]*)"', self.html, re.I)
         if self.DEBUG and data: data = data[:2]
-        ret = dict ( [ ( x[2], x ) for x in data ] )
+        ret = dict ( [ ( int(x[2]), x ) for x in data ] )
         return ret
 
-    def top(self, n):
+    def boundary(self, x):
+        ret = re.findall(r'boundary\s*=\s*["]?(.*)[";]', x, re.I)
+        if ret:
+            return ret[0]
+        else:
+            return None
+
+    def delete(self,n):
+        #"http://posta18.posta.libero.it/cp/ps/Mail/commands/DeleteMessage?d=libero.it&u=gambuzzi&t=d122d4d30d539567&lsrt=25805"
+        #POST selection=3ae36564bd31ad576fa316a61d7c8030
         pid, uid, i, _from = self.coda[n]
+        url = "/cp/ps/Mail/commands/DeleteMessage?"
+        full_url = url + self.params
+        dizio = {'selection' : pid}
+        self.br.open( urlparse.urljoin( self.baseurl, full_url ) , urllib.urlencode(dizio) )
 
-        url = "/cp/ps/Mail/commands/LoadMessage?"
-        full_url = url + self.params +'&'+ urllib.urlencode( {
-          'pid':pid,
-          'uid':uid,
-          'an':'DefaultMailAccount',
-          'fp':'inbox',
-          'sh':'true',
-        } )
-        _top = [self.htmlparser.unescape( x.strip().strip('<pre>').strip('</pre>') ) for x in self.get ( self.baseurl, full_url).splitlines() if x.strip().strip('<pre>').strip('</pre>')]
-        _top = '\r\n'.join(_top[:-1])
+    def top(self, n):
+        if n not in self.cache['top']:
+            pid, uid, i, _from = self.coda[n]
 
-        return _top
+            url = "/cp/ps/Mail/commands/LoadMessage?"
+            full_url = url + self.params +'&'+ urllib.urlencode( {
+              'pid':pid,
+              'uid':uid,
+              'an':'DefaultMailAccount',
+              'fp':'inbox',
+              'sh':'true',
+            } )
+            _top = [self.htmlparser.unescape( x.strip().strip('<pre>').strip('</pre>') ) for x in self.get ( self.baseurl, full_url).splitlines() if x.strip().strip('<pre>').strip('</pre>')]
+            _top = '\r\n'.join(_top[:-1])
+
+            s = re.compile(r';\s*boundary', re.I)
+            _top = s.sub('; boundary', _top)
+
+            s = re.compile(r';\s*charset', re.I)
+            _top = s.sub('; charset', _top)
+
+            s = re.compile(r'\bquoted-printabl\b', re.I)
+            _top = s.sub('quoted-printable', _top)
+
+            self.cache['top'][n] = _top
+
+        return self.cache['top'][n]
 
     def body(self, n):
-        pid, uid, i, _from = self.coda[n]
+        if n not in self.cache['body']:
+            pid, uid, i, _from = self.coda[n]
 
-        url = "/cp/ps/Mail/commands/LoadMessage?"
-        full_url = url + self.params +'&'+ urllib.urlencode( {
-          'pid':pid,
-          'uid':uid,
-          'an':'DefaultMailAccount',
-          'fp':'inbox',
-        } )
-        self.get ( self.baseurl, full_url)
+            url = "/cp/ps/Mail/commands/LoadMessage?"
+            full_url = url + self.params +'&'+ urllib.urlencode( {
+              'pid':pid,
+              'uid':uid,
+              'an':'DefaultMailAccount',
+              'fp':'inbox',
+            } )
+            self.get ( self.baseurl, full_url)
 
-        url = "/cp/MailMessageBody.jsp?"
-        full_url = url + urllib.urlencode( {
-          'pid' : pid,
-          'th'  : self.token_hash,
-        } )
-        _body = self.filter_message( self.get ( self.baseurl, full_url) )
+            url = "/cp/MailMessageBody.jsp?"
+            full_url = url + urllib.urlencode( {
+              'pid' : pid,
+              'th'  : self.token_hash,
+            } )
+            _body = self.filter_message( self.get ( self.baseurl, full_url) )
+            _top = self.top(n)
+            boundary = self.boundary(_top)
+            if boundary:
+                _body = "\r\n\r\n\r\n--" + boundary + "\r\nContent-Type: text/html; charset=UTF-8\r\n"+\
+                        "Content-Transfer-Encoding: quoted-printable\r\n\r\n" + quopri.encodestring(_body.strip(' \r\n')) + \
+                        "\r\n\r\n--" + boundary + "--\r\n"
+            else:
+                _body = "\r\n\r\n" +  quopri.encodestring( _body.strip(' \r\n') ) + "\r\n\r\n"
 
-        return _body
+            self.cache['body'][n] = _body
+        return self.cache['body'][n]
 
     def get(self, url, url_to_join = None ):
         if url_to_join:
