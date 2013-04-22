@@ -89,27 +89,33 @@ def handlePass(data, scrapper):
         return "-ERR Authentication failed."
 
 def handleStat(data, scrapper):
-    try:
-        return "+OK 1 %i" % scrapper.size(0)
-    except:
-        raise
-        return "-ERR No such message"
+    return "+OK %i %i" % (len(scrapper.coda), scrapper.size(0))
+    #return "-ERR No such message"
 
 def handleList(data, scrapper):
-    return "+OK 1 messages (%i octets)\r\n1 %i\r\n." % (scrapper.size(0), scrapper.size(0))
+    K=100
+    ret = "+OK %i messages (%i octets)\r\n" % (len(scrapper.coda), K*len(scrapper.coda))
+    for i in xrange(1, len(scrapper.coda)+1 ):
+        ret = ret + "%i %i\r\n" % (i, K)
+    ret = ret + "."
+    return ret
 
 def handleTop(data, scrapper):
     cmd, num, lines = data.split()
-    assert num == "1", "unknown message number: %s" % num
+    num = int(num)
     return "+OK top of message follows\r\n%s\r\n." % scrapper.top(num-1)
 
 def handleRetr(data, scrapper):
+    cmd, num = data.split()
+    num = int(num)
     log.info("message sent")
-    msg =  scrapper.top(0)+scrapper.body(0)
+    msg =  scrapper.top(num-1)+scrapper.body(num-1)
     return "+OK %i octets\r\n%s\r\n." %(len (msg), msg )
 
 def handleDele(data, scrapper):
-    scrapper.delete(0)
+    cmd, num = data.split()
+    num = int(num)
+    scrapper.delete(num-1)
     return "+OK message 1 deleted"
 
 def handleNoop(data, scrapper):
@@ -311,6 +317,13 @@ class Libero(object):
             s = re.compile(r'\bquoted-printabl\b', re.I)
             _top = s.sub('quoted-printable', _top)
 
+            s = re.compile(r'Content-Transfer-Encoding: .*', re.I)
+            _top = s.sub('Content-Transfer-Encoding: quoted-printable', _top)
+
+            b = self.boundary(_top)
+            if b:
+                _top = _top.replace(b, b.strip('-"') )
+
             self.cache['top'][n] = _top
 
         return self.cache['top'][n]
@@ -375,9 +388,4 @@ if __name__ == "__main__":
         else:
             serve(host, port, Libero())
 
-    """
-    libero = Libero()
-    libero.username= "gambuzzi@libero.it"
-    print libero.login('-------------')
-       
-    print libero.coda"""
+            
