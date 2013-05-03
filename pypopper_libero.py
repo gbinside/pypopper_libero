@@ -19,6 +19,7 @@
 Useage:
     python pypopper.py <port> <path_to_message_file>
 """
+from hashlib import md5
 import collections
 import logging
 import os
@@ -278,7 +279,7 @@ class Libero(object):
         return ret
 
     def boundary(self, x):
-        ret = re.findall(r'boundary\s*=\s*["]?(.*)[";]', x, re.I)
+        ret = re.findall(r'boundary\s*=\s*["]?(.*?)[";\r\n]', x, re.I)
         if ret:
             return ret[0]
         else:
@@ -322,7 +323,7 @@ class Libero(object):
 
             b = self.boundary(_top)
             if b:
-                _top = _top.replace(b, b.strip('-"') )
+                _top = _top.replace(b, md5( os.urandom(10) ).hexdigest() )
 
             self.cache['top'][n] = _top
 
